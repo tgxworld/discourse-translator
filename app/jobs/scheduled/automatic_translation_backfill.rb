@@ -18,35 +18,33 @@ module Jobs
       end
     end
 
-    def fetch_untranslated_model_ids(
-      model,
-      content_column,
-      limit,
-      target_locales = backfill_locales
-    )
+    def fetch_untranslated_model_ids(model, content_column, limit, target_locale)
       m = model.name.downcase
-      DB.query_single(<<~SQL, target_locales: target_locales, limit: limit)
+      DB.query_single(<<~SQL, target_locale: target_locale, limit: limit)
         SELECT m.id
-        FROM #{m}s m
-        LEFT JOIN discourse_translator_#{m}_locales dl ON dl.#{m}_id = m.id
-        LEFT JOIN LATERAL (
-          SELECT array_agg(DISTINCT locale)::text[] as locales
-          FROM discourse_translator_#{m}_translations dt
-          WHERE dt.#{m}_id = m.id
-        ) translations ON true
-        WHERE NOT (
-          ARRAY[:target_locales]::text[] <@
-            (COALESCE(
-              array_cat(
-                ARRAY[COALESCE(dl.detected_locale, '')]::text[],
-                COALESCE(translations.locales, ARRAY[]::text[])
-              ),
-              ARRAY[]::text[]
-            ))
-        )
-        AND m.deleted_at IS NULL
-        AND m.#{content_column} != ''
-        AND m.user_id > 0
+        FROM #{model.table_name} m
+        WHERE m.deleted_at IS NULL
+          AND m.#{content_column} != ''
+          AND m.user_id > 0
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM discourse_translator_#{m}_locales
+              WHERE #{m}_id = m.id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM discourse_translator_#{m}_locales
+              WHERE #{m}_id = m.id
+              AND detected_locale != :target_locale
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM discourse_translator_#{m}_translations
+            WHERE #{m}_id = m.id
+            AND locale = :target_locale
+          )
         ORDER BY m.updated_at DESC
         LIMIT :limit
       SQL
@@ -65,53 +63,60 @@ module Jobs
     end
 
     def translations_per_run
-      [
-        (SiteSetting.automatic_translation_backfill_maximum_translations_per_hour / 12) /
-          backfill_locales.size,
-        1,
-      ].max
+      [(SiteSetting.automatic_translation_backfill_maximum_translations_per_hour / 12), 1].max
     end
 
     def backfill_locales
-      @backfill_locales ||= SiteSetting.automatic_translation_target_languages.split("|")
+      @backfill_locales ||=
+        SiteSetting.automatic_translation_target_languages.split("|").map { |l| l.gsub("_", "-") }
     end
 
     def translator
       @translator_klass ||= "DiscourseTranslator::#{SiteSetting.translator_provider}".constantize
     end
 
-    def translate_records(type, record_ids)
+    def translate_records(type, record_ids, target_locale)
       record_ids.each do |id|
         record = type.find(id)
-        backfill_locales.each do |target_locale|
-          begin
-            translator.translate(record, target_locale.to_sym)
-          rescue => e
-            # continue with other locales even if one fails
-            Rails.logger.warn(
-              "Failed to machine-translate #{type.name}##{id} to #{target_locale}: #{e.message}\n#{e.backtrace.join("\n")}",
-            )
-            next
-          end
+        begin
+          translator.translate(record, target_locale.to_sym)
+        rescue => e
+          # continue with other locales even if one fails
+          Rails.logger.warn(
+            "Failed to machine-translate #{type.name}##{id} to #{target_locale}: #{e.message}\n#{e.backtrace.join("\n")}",
+          )
+          next
         end
       end
     end
 
     def process_batch
       models_translated = [Post, Topic].size
-      translations_per_model = [translations_per_run / models_translated, 1].max
-      topic_ids = fetch_untranslated_model_ids(Topic, "title", translations_per_model)
-      translations_per_model = translations_per_run - topic_ids.size
-      post_ids = fetch_untranslated_model_ids(Post, "cooked", translations_per_model)
+      avg_translations_per_model_per_language = [
+        translations_per_run / models_translated / backfill_locales.size,
+        1,
+      ].max
 
-      DiscourseTranslator::VerboseLogger.log(
-        "Translating #{topic_ids.size} topics and #{post_ids.size} posts to #{backfill_locales.join(", ")}",
-      )
+      records_to_translate = avg_translations_per_model_per_language
+      backfill_locales.each_with_index do |target_locale, i|
+        topic_ids =
+          fetch_untranslated_model_ids(Topic, "title", records_to_translate, target_locale)
+        post_ids = fetch_untranslated_model_ids(Post, "cooked", records_to_translate, target_locale)
 
-      return if topic_ids.empty? && post_ids.empty?
+        # if we end up translating fewer records than records_to_translate,
+        # add to the value so that the next locales can have more quota
+        records_to_translate =
+          avg_translations_per_model_per_language +
+            ((records_to_translate - topic_ids.size - post_ids.size) / backfill_locales.size - i)
+        next if topic_ids.empty? && post_ids.empty?
 
-      translate_records(Topic, topic_ids)
-      translate_records(Post, post_ids)
+        DiscourseTranslator::VerboseLogger.log(
+          "Translating #{topic_ids.size} topics and #{post_ids.size} posts to #{backfill_locales.join(", ")}",
+        )
+
+        translate_records(Topic, topic_ids, target_locale)
+        translate_records(Post, post_ids, target_locale)
+      end
     end
   end
 end
